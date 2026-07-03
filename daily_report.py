@@ -42,7 +42,7 @@ IST = ZoneInfo("Asia/Kolkata")
 # ─────────────────────────── CONFIG ───────────────────────────
 
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-GOOGLE_SHEET_ID         = os.environ.get("GOOGLE_SHEET_ID", "PASTE_SHEET_ID_HERE")
+GOOGLE_SHEET_ID         = os.environ.get("GOOGLE_SHEET_ID", "1H49yAAv4o4KMkSphxOHb40F76DyMuH-4wDaU3wm7xH0")
 
 WATCHLIST = [
     "RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS",
