@@ -305,12 +305,26 @@ def write_to_sheets(rows):
     history_ws = get_or_create_tab(spreadsheet, "History")   # rolling log
     today_ws   = get_or_create_tab(spreadsheet, today_tab)   # daily snapshot
 
-    # ── Write to today's tab (clear first so re-runs overwrite cleanly) ──
-    if today_ws.row_count > 1:
-        today_ws.delete_rows(2, max(2, today_ws.row_count))
+    # ── Clear today's tab so re-runs overwrite cleanly ──
+    # IMPORTANT: we clear cell VALUES (batch_clear), not delete_rows().
+    # Row 1 is frozen (see get_or_create_tab), and the Sheets API refuses
+    # any deleteDimension request that would remove every non-frozen row
+    # (error: "Sorry, it is not possible to delete all non-frozen rows").
+    # The previous version called delete_rows(2, row_count) which does
+    # exactly that whenever the tab has no rows below the header left
+    # over — clearing values instead sidesteps the restriction entirely
+    # and needs no row-count math.
+    last_col_letter = gspread.utils.rowcol_to_a1(1, len(HEADERS)).rstrip("0123456789")
+    clear_range = f"A2:{last_col_letter}{max(today_ws.row_count, 1000)}"
+    try:
+        today_ws.batch_clear([clear_range])
+    except Exception as e:
+        print(f"[sheets] Warning: could not clear existing rows in '{today_tab}' "
+              f"before rewriting ({e}); proceeding to append anyway.")
 
     sheet_rows = [row_to_sheet_values(i + 1, r) for i, r in enumerate(rows)]
     if sheet_rows:
+        reset_row_formatting(today_ws)
         today_ws.append_rows(sheet_rows, value_input_option="USER_ENTERED")
         color_by_quadrant(today_ws, sheet_rows)
 
@@ -319,6 +333,34 @@ def write_to_sheets(rows):
 
     print(f"[sheets] Wrote {len(sheet_rows)} row(s) to '{today_tab}' tab and History.")
     return today_tab
+
+
+def reset_row_formatting(ws):
+    """
+    Clear any leftover quadrant background coloring from a previous run
+    on this tab, so a re-run with fewer/different rows doesn't leave
+    stale colored cells behind. Cheap: one batch_update over a generous
+    row range.
+    """
+    quadrant_col = HEADERS.index("Quadrant") + 1
+    try:
+        ws.spreadsheet.batch_update({
+            "requests": [{
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 1,
+                        "endRowIndex": max(ws.row_count, 1000),
+                        "startColumnIndex": quadrant_col - 1,
+                        "endColumnIndex": quadrant_col,
+                    },
+                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            }]
+        })
+    except Exception as e:
+        print(f"[sheets] Warning: could not reset row formatting: {e}")
 
 
 def color_by_quadrant(ws, sheet_rows):
