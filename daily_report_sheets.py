@@ -54,7 +54,35 @@ CHANGE LOG vs previous version
   exact-minute tick (sleep/throttle) doesn't skip the whole day.
 - run_once() wraps the whole pipeline in try/except and writes a
   FAILED row to the Summary tab on error instead of failing silently.
+
+CHANGE LOG (this revision) — fixes "0 stocks returned" problem
+----------------------------------------------------------------
+The previous version could legitimately return ZERO stocks if no
+symbol satisfied every hard+soft gate simultaneously (e.g. during a
+choppy market where several names sit just under their 200-DMA).
+That's not a bug, but it's not useful for a "give me today's picks"
+tool either. This revision changes the philosophy:
+
+- STRICT_MODE (config flag, default False): when False, filters no
+  longer hard-drop stocks. Every stock that has usable technical data
+  is scored and ranked; the sheet gets the TOP_N best available
+  candidates regardless of whether they'd have passed the old gates.
+  Two new columns ("Meets All Filters", "Filter Notes") tell you
+  which gates each one did/didn't clear, so you keep the filter
+  information without losing the recommendation itself. Set
+  STRICT_MODE = True to restore the old hard-drop behavior.
+- Added retry-with-backoff around every yfinance network call
+  (.info, .history, .cashflow, .news, .recommendations). Transient
+  "Too Many Requests" / connection errors are a common reason
+  yfinance silently returns empty data, which previously looked
+  identical to "this stock failed the filters."
+- Added a run-level diagnostic summary printed every run (not just
+  --dry-run): how many symbols had usable price history, how many
+  had usable fundamental data, etc. If you're getting 0 stocks because
+  of a network/data problem rather than a filter problem, this tells
+  you immediately instead of you having to guess.
 """
+
 
 import os, sys, time, json, argparse, traceback
 import pandas as pd
@@ -67,6 +95,31 @@ from google.oauth2.service_account import Credentials
 
 _sentiment_analyzer = SentimentIntensityAnalyzer()
 IST = ZoneInfo("Asia/Kolkata")
+
+
+def fetch_with_retry(fn, *args, retries=None, backoff=None, label="", **kwargs):
+    """
+    Call fn(*args, **kwargs), retrying on exception with exponential backoff.
+    yfinance hits Yahoo's unofficial endpoints, which regularly return
+    transient failures (rate limiting, connection resets) that look
+    identical to "this stock just has no data" if you don't retry.
+    Returns fn's result, or None if every attempt fails.
+    """
+    retries = FETCH_RETRIES if retries is None else retries
+    backoff = FETCH_BACKOFF_SEC if backoff is None else backoff
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                wait = backoff * (2 ** (attempt - 1))
+                print(f"[retry] {label or fn.__name__} attempt {attempt}/{retries} "
+                      f"failed ({e}); retrying in {wait:.1f}s")
+                time.sleep(wait)
+    print(f"[retry] {label or fn.__name__} failed after {retries} attempts: {last_err}")
+    return None
 
 # ─────────────────────────── CONFIG ───────────────────────────
 
@@ -83,14 +136,24 @@ WATCHLIST = [
 TOP_N                   = 10    # rows written to the sheet
 LOOKBACK_DAYS           = 400
 REQUEST_PAUSE_SEC       = 0.3   # be polite to Yahoo's unofficial endpoints
+FETCH_RETRIES           = 3     # retries for transient yfinance/network failures
+FETCH_BACKOFF_SEC       = 1.5   # base backoff, doubles each retry
 
 # ── Shortlist gate ──
-# "Hard" gates disqualify a stock outright. "Soft" gates only apply a
-# scoring penalty/bonus and are skipped (not penalized) when data is
-# missing, since Yahoo's NSE analyst/broker coverage is often absent.
-REQUIRE_ABOVE_200DMA      = True     # hard gate
-MIN_FUNDAMENTAL_SCORE     = 4        # hard gate, out of 10
-ACCEPTED_ANALYST_RATINGS  = {"buy", "strong_buy"}  # soft gate (see passes_filters)
+# STRICT_MODE = False (default): filters never hard-drop a stock. Every
+#   symbol with usable price history gets scored and ranked; the sheet
+#   always gets the TOP_N best candidates available that day. Each row
+#   is labeled with which filters it did/didn't clear via the
+#   "Meets All Filters" / "Filter Notes" columns, so you keep the
+#   filter information without ever silently getting zero rows.
+# STRICT_MODE = True: restores the old behavior — any stock failing a
+#   "hard" gate below is dropped entirely, and only stocks passing every
+#   gate are eligible. Can legitimately produce 0 results on a given day.
+STRICT_MODE               = False
+
+REQUIRE_ABOVE_200DMA      = True     # hard gate (only enforced if STRICT_MODE)
+MIN_FUNDAMENTAL_SCORE     = 4        # hard gate, out of 10 (only enforced if STRICT_MODE)
+ACCEPTED_ANALYST_RATINGS  = {"buy", "strong_buy"}  # soft gate
 MIN_SENTIMENT_SCORE       = -0.05    # soft gate
 MIN_BROKER_BUY_RATIO      = 0.40     # soft gate
 
@@ -150,6 +213,7 @@ HEADERS = [
     "Analyst Rating","Analyst Avg Target ₹",
     "Broker Buy %","Broker Analysts",
     "Sector","Sector Index","Quadrant","RS Change %",
+    "Meets All Filters","Filter Notes",
 ]
 
 
@@ -227,6 +291,8 @@ def row_to_sheet_values(rank, r):
         r.get("sector_index", ""),
         r.get("sector_quadrant", ""),
         r.get("sector_rs_change_pct", ""),
+        "Yes ✅" if r.get("meets_all_filters") else "No ⚠️",
+        "; ".join(r.get("filter_notes", [])) or "-",
     ]
 
 
@@ -310,8 +376,12 @@ def compute_rsi(series, period=14):
 
 def analyze_technicals(symbol, ticker):
     try:
-        hist = ticker.history(period=f"{LOOKBACK_DAYS}d")
-        if hist.empty or len(hist) < 205:
+        hist = fetch_with_retry(ticker.history, period=f"{LOOKBACK_DAYS}d", label=f"{symbol} history")
+        if hist is None or hist.empty:
+            print(f"[technical] {symbol}: no price history returned (fetch failed or symbol has no data)")
+            return None
+        if len(hist) < 205:
+            print(f"[technical] {symbol}: only {len(hist)} rows of history, need >= 205 for 200-DMA")
             return None
         close, vol = hist["Close"], hist["Volume"]
         ma20  = close.rolling(20).mean()
@@ -397,7 +467,7 @@ def dcf_intrinsic_value(symbol, ticker, info, g=0.10, r=0.12, tg=0.04, years=5, 
         return {"intrinsic_value": None, "dcf_skipped_reason": "invalid r <= terminal growth"}
 
     try:
-        cf = ticker.cashflow
+        cf = fetch_with_retry(lambda: ticker.cashflow, label=f"{symbol} cashflow")
         so = info.get("sharesOutstanding")
         if cf is None or cf.empty or not so:
             return {"intrinsic_value": None, "dcf_skipped_reason": "missing cashflow/shares data"}
@@ -436,7 +506,7 @@ def dcf_intrinsic_value(symbol, ticker, info, g=0.10, r=0.12, tg=0.04, years=5, 
 
 def news_sentiment(symbol, ticker, info, n=8):
     try:
-        items = ticker.news or []
+        items = fetch_with_retry(lambda: ticker.news, label=f"{symbol} news") or []
         heads = []
         for it in items[:n]:
             t = it.get("content", {}).get("title") or it.get("title")
@@ -455,7 +525,7 @@ def news_sentiment(symbol, ticker, info, n=8):
 
 def broker_recommendation_trend(symbol, ticker, info):
     try:
-        trend = ticker.recommendations
+        trend = fetch_with_retry(lambda: ticker.recommendations, label=f"{symbol} recommendations")
         if trend is None or trend.empty:
             return {"broker_buy_ratio": None, "broker_total": 0}
         l = trend.iloc[0]
@@ -543,60 +613,72 @@ def stock_sector_rotation(symbol, ticker, info):
 
 # ─────────────────────── FILTERS ─────────────────────────────
 #
-# HARD gates always apply and always disqualify.
-# SOFT gates only disqualify when the data is actually present and
-# unfavorable — missing data (very common for NSE analyst/broker
-# coverage on Yahoo) is treated as "no opinion", not "fail".
+# evaluate_filters() always computes which gates a stock fails and
+# NEVER itself decides to drop the stock — that decision is made by
+# build_report() based on STRICT_MODE. This means:
+#   - STRICT_MODE = False (default): every stock with technical data
+#     gets ranked and shown; "hard" gate failures are just notes.
+#   - STRICT_MODE = True: build_report drops any stock with a
+#     "(hard gate)" note, same as the previous version's behavior.
 #
-# passes_filters returns (passed: bool, reasons: list[str]) so a
-# --dry-run can show exactly why each stock was kept or dropped.
+# "Soft" gate notes (analyst rating, sentiment, broker ratio, sector
+# quadrant) never drop a stock even in STRICT_MODE if the underlying
+# data is simply missing — only an actual unfavorable value counts.
 
-def passes_filters(r):
-    reasons = []
+def evaluate_filters(r):
+    notes = []
+    hard_fail = False
 
     if REQUIRE_ABOVE_200DMA and not r.get("above_200dma"):
-        reasons.append("below 200-DMA (hard gate)")
+        notes.append("below 200-DMA (hard gate)")
+        hard_fail = True
 
     if r.get("fundamental_score", 0) < MIN_FUNDAMENTAL_SCORE:
-        reasons.append(f"fundamental score {r.get('fundamental_score', 0)} < {MIN_FUNDAMENTAL_SCORE} (hard gate)")
+        notes.append(f"fundamental score {r.get('fundamental_score', 0)} < {MIN_FUNDAMENTAL_SCORE} (hard gate)")
+        hard_fail = True
 
     rec = r.get("recommendation")
     if rec not in (None, "n/a") and rec not in ACCEPTED_ANALYST_RATINGS:
-        reasons.append(f"analyst rating '{rec}' not in {ACCEPTED_ANALYST_RATINGS} (soft gate)")
+        notes.append(f"analyst rating '{rec}' not in {ACCEPTED_ANALYST_RATINGS} (soft gate)")
 
     sentiment = r.get("sentiment_score", 0)
     if r.get("headline_count", 0) > 0 and sentiment < MIN_SENTIMENT_SCORE:
-        reasons.append(f"sentiment {sentiment} < {MIN_SENTIMENT_SCORE} (soft gate)")
+        notes.append(f"sentiment {sentiment} < {MIN_SENTIMENT_SCORE} (soft gate)")
 
     br = r.get("broker_buy_ratio")
     if br is not None and br < MIN_BROKER_BUY_RATIO:
-        reasons.append(f"broker buy ratio {br} < {MIN_BROKER_BUY_RATIO} (soft gate)")
+        notes.append(f"broker buy ratio {br} < {MIN_BROKER_BUY_RATIO} (soft gate)")
 
     if EXCLUDE_LAGGING and r.get("sector_quadrant") == "Lagging":
-        reasons.append("sector quadrant is Lagging (soft gate)")
+        notes.append("sector quadrant is Lagging (soft gate)")
 
-    return (len(reasons) == 0, reasons)
+    return {"meets_all_filters": len(notes) == 0, "hard_fail": hard_fail, "filter_notes": notes}
 
 
 # ────────────────────── BUILD REPORT ─────────────────────────
 
 def build_report(verbose=False):
     rows = []
-    rejections = []  # (symbol, reasons) for --dry-run visibility
+    no_history = []   # symbols we couldn't even get price data for
+
+    diag = {"scanned": 0, "history_ok": 0, "info_ok": 0}
 
     for sym in WATCHLIST:
+        diag["scanned"] += 1
         ticker = yf.Ticker(sym)
 
         tech = analyze_technicals(sym, ticker)
         if not tech:
-            rejections.append((sym, ["insufficient price history"]))
+            no_history.append(sym)
             continue
+        diag["history_ok"] += 1
 
-        try:
-            info = ticker.info or {}
-        except Exception as e:
-            print(f"[info] {sym}: {e}")
-            info = {}
+        info = fetch_with_retry(lambda: ticker.info, label=f"{sym} info") or {}
+        if info:
+            diag["info_ok"] += 1
+        else:
+            print(f"[info] {sym}: .info returned empty after retries — "
+                  f"fundamental/analyst/sector fields will be blank for this stock")
 
         for fn in (analyst_consensus, fundamental_score, dcf_intrinsic_value,
                    news_sentiment, broker_recommendation_trend, stock_sector_rotation):
@@ -617,35 +699,59 @@ def build_report(verbose=False):
         c += tech.get("sector_score_adj", 0)
         tech["combined_score"] = round(c, 2)
 
+        tech.update(evaluate_filters(tech))
         rows.append(tech)
         time.sleep(REQUEST_PAUSE_SEC)
 
+    print(f"\n[diagnostics] {diag['scanned']} symbols scanned, "
+          f"{diag['history_ok']} had usable price history, "
+          f"{diag['info_ok']} had usable fundamental/.info data.")
+    if no_history:
+        print(f"[diagnostics] No price history for: {', '.join(no_history)} "
+              f"(likely a yfinance/network issue if this list is long — "
+              f"see the [technical]/[retry] lines above for the specific error)")
+
     if not rows:
-        if verbose:
-            print("[build_report] No stocks had usable technical data at all.")
-        return [], rejections
+        print("[build_report] No stocks had usable technical data at all — "
+              "this is a data/connectivity problem, not a filter problem. "
+              "Nothing can be ranked or written until at least some symbols "
+              "return price history.")
+        return [], []
 
-    scored_with_filters = [(r, *passes_filters(r)) for r in rows]
-    passed    = [r for (r, ok, _) in scored_with_filters if ok]
-    for r, ok, reasons in scored_with_filters:
-        if not ok:
-            rejections.append((r["symbol"], reasons))
+    if STRICT_MODE:
+        eligible = [r for r in rows if not r["hard_fail"]]
+        dropped  = [r for r in rows if r["hard_fail"]]
+        if not eligible:
+            print("[build_report] STRICT_MODE=True and every scanned stock failed "
+                  "a hard gate today — 0 stocks will be written. Set STRICT_MODE=False "
+                  "to always get a ranked list of the best available candidates instead.")
+    else:
+        eligible = rows
+        dropped  = []
 
-    shortlisted = sorted(passed, key=lambda x: x["combined_score"], reverse=True)[:TOP_N]
+    shortlisted = sorted(eligible, key=lambda x: x["combined_score"], reverse=True)[:TOP_N]
 
     if verbose:
-        print(f"\n[build_report] {len(rows)} scanned, {len(passed)} passed filters, "
-              f"{len(shortlisted)} shortlisted (TOP_N={TOP_N})\n")
-        print("--- Shortlisted ---")
+        print(f"\n[build_report] {len(rows)} scanned with data, {len(eligible)} eligible "
+              f"(STRICT_MODE={STRICT_MODE}), {len(shortlisted)} shortlisted (TOP_N={TOP_N})\n")
+        print("--- Shortlisted (ranked) ---")
         for i, r in enumerate(shortlisted, 1):
-            print(f"{i:>2}. {r['symbol']:<14} score={r['combined_score']:<6} "
+            flag = "✅" if r["meets_all_filters"] else "⚠️ "
+            print(f"{i:>2}. {flag} {r['symbol']:<14} score={r['combined_score']:<6} "
                   f"close={r.get('last_close')}  sector={r.get('sector_label')}  "
                   f"quadrant={r.get('sector_quadrant')}")
-        print("\n--- Rejected ---")
-        for sym, reasons in rejections:
-            print(f"  {sym:<14} {'; '.join(reasons)}")
+            if r["filter_notes"]:
+                print(f"       notes: {'; '.join(r['filter_notes'])}")
+        if dropped:
+            print("\n--- Dropped by STRICT_MODE hard gates ---")
+            for r in dropped:
+                print(f"  {r['symbol']:<14} {'; '.join(r['filter_notes'])}")
+        if no_history:
+            print("\n--- No price history (excluded before scoring) ---")
+            for sym in no_history:
+                print(f"  {sym}")
 
-    return shortlisted, rejections
+    return shortlisted, dropped
 
 
 # ────────────────── SUMMARY TAB ──────────────────────────────
