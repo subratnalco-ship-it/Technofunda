@@ -256,11 +256,42 @@ def get_sheet_id():
     return GOOGLE_SHEET_ID
 
 
+def sync_headers(ws, tab_name):
+    """
+    Make sure an EXISTING worksheet's header row (row 1) matches the
+    current HEADERS list exactly.
+
+    Without this, a tab created by an older version of this script
+    (e.g. "History", or a dated tab re-run on the same day before this
+    update) keeps its old header row forever, since get_or_create_tab()
+    previously only wrote headers at creation time. New columns (like
+    "20D High Breakout") then get appended as extra, unlabeled values
+    past the old header — they're in the sheet, but with no header text,
+    so they're easy to miss or look "missing" entirely.
+
+    This resizes the sheet if it has fewer columns than HEADERS needs,
+    then overwrites row 1 with the current HEADERS whenever it differs
+    from what's already there.
+    """
+    needed_cols = len(HEADERS)
+    if ws.col_count < needed_cols:
+        ws.resize(cols=needed_cols)
+
+    existing_header = ws.row_values(1)
+    if existing_header != HEADERS:
+        print(f"[sheets] Header mismatch on '{tab_name}' tab — updating to current schema "
+              f"({len(existing_header)} -> {len(HEADERS)} columns).")
+        last_col = gspread.utils.rowcol_to_a1(1, needed_cols).rstrip("1")
+        ws.update(f"A1:{last_col}1", [HEADERS], value_input_option="USER_ENTERED")
+        ws.format(f"A1:{last_col}1", {"textFormat": {"bold": True}})
+
+
 def get_or_create_tab(spreadsheet, tab_name):
-    """Return existing worksheet or create a new one with the standard headers."""
+    """Return existing worksheet (with headers kept in sync) or create a new one."""
     try:
         ws = spreadsheet.worksheet(tab_name)
         print(f"[sheets] Using existing tab: {tab_name}")
+        sync_headers(ws, tab_name)
         return ws
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=tab_name, rows=200, cols=len(HEADERS))
