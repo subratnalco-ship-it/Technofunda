@@ -2,7 +2,8 @@
 Daily Stock Recommendation Agent → Google Sheets
 -------------------------------------------------
 Combines:
-  1. Technical signals (RSI, MA crossover, volume spike, 200-DMA gate)
+  1. Technical signals (RSI, MA crossover, volume spike, 200-DMA gate,
+     20-day high breakout)
   2. Fundamental analysis (P/E, ROE, D/E, margins, revenue growth)
   3. DCF intrinsic value model (skipped for banks/financials, averaged over
      multiple years, with guardrails on the discount/terminal-growth spread)
@@ -81,6 +82,21 @@ tool either. This revision changes the philosophy:
   had usable fundamental data, etc. If you're getting 0 stocks because
   of a network/data problem rather than a filter problem, this tells
   you immediately instead of you having to guess.
+
+CHANGE LOG (this revision) — 20-day high breakout signal
+----------------------------------------------------------------
+- analyze_technicals() now also checks whether today's close crosses
+  above the highest close of the prior 20 trading days (a classic
+  breakout / buying trigger). Exposed as "crosses_20d_high" and
+  "high_20d_prev" on the technical result dict.
+- This is added as an ADDITIONAL scoring input alongside the existing
+  bullish_cross / uptrend / healthy_rsi / vol_spike factors — it does
+  NOT replace or alter any of them, and it is not wired in as a new
+  hard/soft filter gate, so every previously existing condition
+  (200-DMA gate, fundamental score gate, analyst/sentiment/broker soft
+  gates, STRICT_MODE behavior, etc.) behaves exactly as before.
+- New "20D High Breakout" column added to the Google Sheet output so
+  the signal is visible per-row, right after the "Above 200-DMA" column.
 """
 
 
@@ -138,6 +154,7 @@ LOOKBACK_DAYS           = 400
 REQUEST_PAUSE_SEC       = 0.3   # be polite to Yahoo's unofficial endpoints
 FETCH_RETRIES           = 3     # retries for transient yfinance/network failures
 FETCH_BACKOFF_SEC       = 1.5   # base backoff, doubles each retry
+HIGH_20D_LOOKBACK       = 20    # window for the 20-day-high breakout signal
 
 # ── Shortlist gate ──
 # STRICT_MODE = False (default): filters never hard-drop a stock. Every
@@ -207,6 +224,7 @@ HEADERS = [
     "Rank","Symbol","Date","Score",
     "Entry ₹","Stop-Loss ₹","Target ₹",
     "Last Close ₹","RSI","Trend","200-DMA ₹","Above 200-DMA",
+    "20D High Breakout","20D High Prev ₹",
     "Fundamental /10","P/E","ROE %","Profit Margin %","Revenue Growth %","D/E",
     "DCF Intrinsic Value ₹","vs CMP %",
     "News Sentiment","Sentiment Score",
@@ -273,6 +291,8 @@ def row_to_sheet_values(rank, r):
         "Up" if r.get("uptrend") else "Flat/Down",
         r.get("ma200", ""),
         "Yes ✅" if r.get("above_200dma") else "No ❌",
+        "Yes ✅" if r.get("crosses_20d_high") else "No ❌",
+        r.get("high_20d_prev", ""),
         r.get("fundamental_score", ""),
         round(r["pe"], 1) if r.get("pe") else "",
         f"{r['roe']*100:.1f}" if r.get("roe") else "",
@@ -439,7 +459,18 @@ def analyze_technicals(symbol, ticker):
         healthy_rsi   = 45 <= rsi.iloc[-1] <= 68
         vol_spike     = vol.iloc[-1] > 1.3 * vol.rolling(20).mean().iloc[-1]
 
-        score = sum([bullish_cross * 2, uptrend, healthy_rsi, vol_spike])
+        # ── 20-day high breakout ──
+        # True when today's close crosses above the highest close of the
+        # prior HIGH_20D_LOOKBACK trading days (classic breakout trigger).
+        # Uses the window BEFORE today so a stock only qualifies the day
+        # it actually breaks out, not every day it simply sits at a high.
+        high_20d_prev = None
+        crosses_20d_high = False
+        if len(close) > HIGH_20D_LOOKBACK:
+            high_20d_prev = close.iloc[-(HIGH_20D_LOOKBACK + 1):-1].max()
+            crosses_20d_high = bool(pd.notna(high_20d_prev) and lc > high_20d_prev)
+
+        score = sum([bullish_cross * 2, uptrend, healthy_rsi, vol_spike, crosses_20d_high])
         atr   = (hist["High"] - hist["Low"]).rolling(14).mean().iloc[-1]
         rlow  = close.rolling(20).min().iloc[-1]
 
@@ -452,6 +483,8 @@ def analyze_technicals(symbol, ticker):
             "target": round(lc + 2.5 * atr, 2),
             "ma200": round(l200, 2) if pd.notna(l200) else None,
             "above_200dma": above200,
+            "crosses_20d_high": crosses_20d_high,
+            "high_20d_prev": round(high_20d_prev, 2) if pd.notna(high_20d_prev) else None,
         }
     except Exception as e:
         print(f"[technical] {symbol}: {e}")
@@ -666,6 +699,11 @@ def stock_sector_rotation(symbol, ticker, info):
 # "Soft" gate notes (analyst rating, sentiment, broker ratio, sector
 # quadrant) never drop a stock even in STRICT_MODE if the underlying
 # data is simply missing — only an actual unfavorable value counts.
+#
+# NOTE: the 20-day high breakout signal is intentionally NOT wired in
+# here as a new gate. It only feeds into combined_score in
+# build_report(), exactly like volume_spike/healthy_rsi/etc already
+# did — so every existing hard/soft condition below is unchanged.
 
 def evaluate_filters(r):
     notes = []
@@ -779,9 +817,10 @@ def build_report(verbose=False):
         print("--- Shortlisted (ranked) ---")
         for i, r in enumerate(shortlisted, 1):
             flag = "✅" if r["meets_all_filters"] else "⚠️ "
+            breakout = "🚀20D-HIGH" if r.get("crosses_20d_high") else ""
             print(f"{i:>2}. {flag} {r['symbol']:<14} score={r['combined_score']:<6} "
                   f"close={r.get('last_close')}  sector={r.get('sector_label')}  "
-                  f"quadrant={r.get('sector_quadrant')}")
+                  f"quadrant={r.get('sector_quadrant')}  {breakout}")
             if r["filter_notes"]:
                 print(f"       notes: {'; '.join(r['filter_notes'])}")
         if dropped:
