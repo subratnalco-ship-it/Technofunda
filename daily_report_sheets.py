@@ -85,18 +85,30 @@ tool either. This revision changes the philosophy:
 
 CHANGE LOG (this revision) — 20-day high breakout signal
 ----------------------------------------------------------------
-- analyze_technicals() now also checks whether today's close crosses
-  above the highest close of the prior 20 trading days (a classic
-  breakout / buying trigger). Exposed as "crosses_20d_high" and
-  "high_20d_prev" on the technical result dict.
-- This is added as an ADDITIONAL scoring input alongside the existing
-  bullish_cross / uptrend / healthy_rsi / vol_spike factors — it does
-  NOT replace or alter any of them, and it is not wired in as a new
-  hard/soft filter gate, so every previously existing condition
-  (200-DMA gate, fundamental score gate, analyst/sentiment/broker soft
-  gates, STRICT_MODE behavior, etc.) behaves exactly as before.
-- New "20D High Breakout" column added to the Google Sheet output so
-  the signal is visible per-row, right after the "Above 200-DMA" column.
+- analyze_technicals() checks whether today's close crosses above the
+  highest close of the prior 20 trading days (a classic breakout /
+  buying trigger). Exposed as "crosses_20d_high" and "high_20d_prev"
+  on the technical result dict.
+- New "20D High Breakout" column added to the Google Sheet output,
+  right after the "Above 200-DMA" column.
+- get_or_create_tab() now syncs the header row on every reused
+  worksheet (not just newly created ones), so older tabs (e.g.
+  "History") automatically pick up newly added columns like this one
+  instead of silently appending them unlabeled.
+
+CHANGE LOG (this revision) — 20-day high breakout is now a hard gate
+----------------------------------------------------------------------
+- REQUIRE_20D_HIGH_BREAKOUT (default True) added alongside
+  REQUIRE_ABOVE_200DMA. Like that flag, it is a "hard" gate that is
+  only actually enforced when STRICT_MODE = True — with STRICT_MODE
+  False (the default) it still just shows up in "Meets All Filters" /
+  "Filter Notes" as informational, same as every other hard gate.
+- crosses_20d_high is a pass/fail buying condition now, not a score
+  contributor — it was removed from the combined_score sum, mirroring
+  how above_200dma was already a gate rather than a scoring input.
+  Every other existing condition (fundamental score gate, analyst/
+  sentiment/broker soft gates, sector rotation adjustment, etc.) is
+  unchanged.
 """
 
 
@@ -169,6 +181,7 @@ HIGH_20D_LOOKBACK       = 20    # window for the 20-day-high breakout signal
 STRICT_MODE               = False
 
 REQUIRE_ABOVE_200DMA      = True     # hard gate (only enforced if STRICT_MODE)
+REQUIRE_20D_HIGH_BREAKOUT = True     # hard gate (only enforced if STRICT_MODE) — must cross the prior 20-day high
 MIN_FUNDAMENTAL_SCORE     = 4        # hard gate, out of 10 (only enforced if STRICT_MODE)
 ACCEPTED_ANALYST_RATINGS  = {"buy", "strong_buy"}  # soft gate
 MIN_SENTIMENT_SCORE       = -0.05    # soft gate
@@ -501,7 +514,7 @@ def analyze_technicals(symbol, ticker):
             high_20d_prev = close.iloc[-(HIGH_20D_LOOKBACK + 1):-1].max()
             crosses_20d_high = bool(pd.notna(high_20d_prev) and lc > high_20d_prev)
 
-        score = sum([bullish_cross * 2, uptrend, healthy_rsi, vol_spike, crosses_20d_high])
+        score = sum([bullish_cross * 2, uptrend, healthy_rsi, vol_spike])
         atr   = (hist["High"] - hist["Low"]).rolling(14).mean().iloc[-1]
         rlow  = close.rolling(20).min().iloc[-1]
 
@@ -731,10 +744,10 @@ def stock_sector_rotation(symbol, ticker, info):
 # quadrant) never drop a stock even in STRICT_MODE if the underlying
 # data is simply missing — only an actual unfavorable value counts.
 #
-# NOTE: the 20-day high breakout signal is intentionally NOT wired in
-# here as a new gate. It only feeds into combined_score in
-# build_report(), exactly like volume_spike/healthy_rsi/etc already
-# did — so every existing hard/soft condition below is unchanged.
+# NOTE: the 20-day high breakout signal (REQUIRE_20D_HIGH_BREAKOUT) is
+# wired in below as a "hard" gate, same tier as REQUIRE_ABOVE_200DMA —
+# only enforced (i.e. actually drops the stock) when STRICT_MODE=True.
+# It no longer contributes to combined_score directly.
 
 def evaluate_filters(r):
     notes = []
@@ -742,6 +755,10 @@ def evaluate_filters(r):
 
     if REQUIRE_ABOVE_200DMA and not r.get("above_200dma"):
         notes.append("below 200-DMA (hard gate)")
+        hard_fail = True
+
+    if REQUIRE_20D_HIGH_BREAKOUT and not r.get("crosses_20d_high"):
+        notes.append("did not cross 20-day high (hard gate)")
         hard_fail = True
 
     if r.get("fundamental_score", 0) < MIN_FUNDAMENTAL_SCORE:
