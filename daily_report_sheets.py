@@ -109,10 +109,30 @@ CHANGE LOG (this revision) — 20-day high breakout is now a hard gate
   Every other existing condition (fundamental score gate, analyst/
   sentiment/broker soft gates, sector rotation adjustment, etc.) is
   unchanged.
+
+CHANGE LOG (this revision) — watchlist switched to Nifty LargeMidcap 250
+----------------------------------------------------------------------
+- WATCHLIST (a hardcoded 20-symbol list) is replaced by get_watchlist(),
+  which downloads NSE Indices' official Nifty LargeMidcap 250 constituent
+  CSV at the start of every run (that index = all Nifty 100 + Nifty
+  Midcap 150 stocks, ~250 names, rebalanced semi-annually). This keeps
+  the scanned universe in sync with the real index automatically instead
+  of a list that silently goes stale as the index is reconstituted.
+- FALLBACK_WATCHLIST keeps the original 20-symbol list as a safety net —
+  used only if every live download attempt fails (site down, blocked,
+  CSV format changed, parsed result looks truncated), so the script can
+  still run and produce a report rather than erroring out.
+- build_report() now returns the watchlist it actually used as a third
+  value, so run_once()'s "Stocks Scanned" figure in the Summary tab
+  reflects the real (possibly live-fetched) universe size rather than a
+  stale constant.
+- TOP_N (still 10) is unchanged, so the sheet still surfaces the best 10
+  candidates — just now selected out of ~250 stocks instead of 20.
 """
 
 
-import os, sys, time, json, argparse, traceback
+import os, sys, time, json, io, argparse, traceback
+import requests
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
@@ -154,12 +174,83 @@ def fetch_with_retry(fn, *args, retries=None, backoff=None, label="", **kwargs):
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID         = os.environ.get("GOOGLE_SHEET_ID", "")  # no silent fallback
 
-WATCHLIST = [
+# ── Watchlist: NSE Nifty LargeMidcap 250 (all Nifty 100 + Nifty Midcap 150
+#    constituents), pulled live from NSE Indices' published CSV so the
+#    scanned universe always tracks the index's semi-annual reconstitution
+#    instead of a hand-maintained ticker list going stale. See
+#    fetch_nifty_largemidcap250() / get_watchlist() below.
+NIFTY_LARGEMIDCAP250_CSV_URLS = [
+    "https://niftyindices.com/IndexConstituent/ind_niftylargemidcap250list.csv",
+    "https://nsearchives.nseindia.com/content/indices/ind_niftylargemidcap250list.csv",
+]
+EXPECTED_NIFTY_LARGEMIDCAP250_SIZE = 250
+MIN_ACCEPTABLE_INDEX_SIZE          = 200  # sanity floor: reject a CSV that looks truncated/wrong
+
+# Used ONLY if every live download attempt fails (site down, geo-blocked,
+# CSV format changed, etc.) so the script can still produce a report
+# instead of erroring out with an empty universe.
+FALLBACK_WATCHLIST = [
     "RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS",
     "LT.NS","SBIN.NS","BHARTIARTL.NS","ITC.NS","AXISBANK.NS",
     "KOTAKBANK.NS","MARUTI.NS","TATAMOTORS.NS","SUNPHARMA.NS","TITAN.NS",
     "BAJFINANCE.NS","ADANIENT.NS","ULTRACEMCO.NS","WIPRO.NS","HCLTECH.NS",
 ]
+
+
+def fetch_nifty_largemidcap250(timeout=15):
+    """
+    Downloads NSE Indices' published constituent CSV for the Nifty
+    LargeMidcap 250 (the "Index Constituent" download on the official
+    index page — all Nifty 100 + Nifty Midcap 150 stocks). Tries each URL
+    in NIFTY_LARGEMIDCAP250_CSV_URLS in order.
+
+    Returns a list of "<SYMBOL>.NS" tickers on success, or None if every
+    source fails / returns something that doesn't look like a real
+    ~250-row constituent list (so callers can fall back safely instead of
+    silently scanning a bad/truncated universe).
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DailyStockAgent/1.0)"}
+    for url in NIFTY_LARGEMIDCAP250_CSV_URLS:
+        resp = fetch_with_retry(
+            lambda: requests.get(url, headers=headers, timeout=timeout),
+            label=f"Nifty LargeMidcap 250 list ({url})",
+        )
+        if resp is None:
+            continue
+        try:
+            if resp.status_code != 200 or not resp.text.strip():
+                print(f"[watchlist] {url}: HTTP {getattr(resp, 'status_code', '?')} or empty body")
+                continue
+            df = pd.read_csv(io.StringIO(resp.text))
+            symbol_col = next((c for c in df.columns if c.strip().lower() == "symbol"), None)
+            if not symbol_col:
+                print(f"[watchlist] {url}: no 'Symbol' column found (columns: {list(df.columns)})")
+                continue
+            symbols = [f"{str(s).strip()}.NS" for s in df[symbol_col].dropna().tolist() if str(s).strip()]
+            if len(symbols) < MIN_ACCEPTABLE_INDEX_SIZE:
+                print(f"[watchlist] {url}: only parsed {len(symbols)} symbols "
+                      f"(expected ~{EXPECTED_NIFTY_LARGEMIDCAP250_SIZE}) — treating as unreliable")
+                continue
+            print(f"[watchlist] Loaded {len(symbols)} symbols from Nifty LargeMidcap 250 ({url})")
+            return symbols
+        except Exception as e:
+            print(f"[watchlist] Failed to parse CSV from {url}: {e}")
+    return None
+
+
+def get_watchlist():
+    """
+    Returns the symbols to scan: the live Nifty LargeMidcap 250
+    constituent list if the download succeeds, otherwise the small
+    static FALLBACK_WATCHLIST so the script can still run.
+    """
+    live = fetch_nifty_largemidcap250()
+    if live:
+        return live
+    print(f"[watchlist] Live Nifty LargeMidcap 250 download failed — falling back to the "
+          f"static {len(FALLBACK_WATCHLIST)}-symbol watchlist (see [watchlist]/[retry] lines above "
+          f"for why). Fix network/site access to scan the full index again.")
+    return FALLBACK_WATCHLIST
 
 TOP_N                   = 10    # rows written to the sheet
 LOOKBACK_DAYS           = 400
@@ -785,13 +876,16 @@ def evaluate_filters(r):
 
 # ────────────────────── BUILD REPORT ─────────────────────────
 
-def build_report(verbose=False):
+def build_report(verbose=False, watchlist=None):
+    if watchlist is None:
+        watchlist = get_watchlist()
+
     rows = []
     no_history = []   # symbols we couldn't even get price data for
 
     diag = {"scanned": 0, "history_ok": 0, "info_ok": 0}
 
-    for sym in WATCHLIST:
+    for sym in watchlist:
         diag["scanned"] += 1
         ticker = yf.Ticker(sym)
 
@@ -844,7 +938,7 @@ def build_report(verbose=False):
               "this is a data/connectivity problem, not a filter problem. "
               "Nothing can be ranked or written until at least some symbols "
               "return price history.")
-        return [], []
+        return [], [], watchlist
 
     if STRICT_MODE:
         eligible = [r for r in rows if not r["hard_fail"]]
@@ -880,7 +974,7 @@ def build_report(verbose=False):
             for sym in no_history:
                 print(f"  {sym}")
 
-    return shortlisted, dropped
+    return shortlisted, dropped, watchlist
 
 
 # ────────────────── SUMMARY TAB ──────────────────────────────
@@ -911,7 +1005,7 @@ def run_once(dry_run=False):
           f"{' (DRY RUN — no Sheets writes)' if dry_run else ''}...")
 
     try:
-        shortlisted, rejections = build_report(verbose=dry_run)
+        shortlisted, rejections, watchlist_used = build_report(verbose=dry_run)
     except Exception as e:
         print(f"[run_once] Report build failed: {e}")
         traceback.print_exc()
@@ -919,12 +1013,16 @@ def run_once(dry_run=False):
             try:
                 client = get_gspread_client()
                 spreadsheet = client.open_by_key(get_sheet_id())
-                update_summary_tab(spreadsheet, "-", 0, len(WATCHLIST), status="FAILED", note=str(e))
+                # We may have failed before the watchlist was even fetched
+                # (e.g. inside build_report before it returns), so fall
+                # back to the fallback list's length rather than crashing
+                # this failure-logging path itself.
+                update_summary_tab(spreadsheet, "-", 0, len(FALLBACK_WATCHLIST), status="FAILED", note=str(e))
             except Exception as inner:
                 print(f"[run_once] Could not even log failure to Summary tab: {inner}")
         return
 
-    scanned = len(WATCHLIST)
+    scanned = len(watchlist_used)
 
     if dry_run:
         print("\n[dry-run] Skipping Google Sheets write.")
