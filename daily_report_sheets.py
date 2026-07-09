@@ -12,8 +12,8 @@ Combines:
      treated as "soft" signals since NSE coverage is sparse)
   6. Sector rotation (RRG-style quadrant vs Nifty 500 benchmark)
 
-Output: writes a dated tab inside a Google Sheet every weekday morning.
-        Old tabs are kept so you have a rolling history.
+Output: writes a dated tab inside a Google Sheet every weekday, after
+        market close. Old tabs are kept so you have a rolling history.
 
 SETUP  (full step-by-step guide is in the README — read that first)
 -----
@@ -30,8 +30,9 @@ RUNNING
   python3 daily_report_sheets.py --now --dry-run   # run once, print only,
                                                     # no Sheets writes, shows
                                                     # WHY each stock passed/failed
-  python3 daily_report_sheets.py --schedule         # persistent 8 AM IST
-                                                    # weekday loop
+  python3 daily_report_sheets.py --schedule         # persistent after-market
+                                                    # weekday loop (see
+                                                    # SCHEDULED_HOUR/MINUTE)
 
 CHANGE LOG vs previous version
 -------------------------------
@@ -160,6 +161,32 @@ CHANGE LOG (this revision) — 2x delivery-volume spike signal
   condition (fundamental gate, analyst/sentiment/broker soft gates,
   sector rotation adjustment, combined_score formula, etc.) is
   unchanged.
+
+CHANGE LOG (this revision) — scheduled run moved to after market close
+----------------------------------------------------------------------
+- The old default schedule (8:00 AM IST) ran BEFORE the market opens
+  (NSE trading hours are 09:15-15:30 IST), which meant every run used
+  the PREVIOUS trading day's closing prices/technicals, AND the
+  delivery-volume signal was working off whatever bhavcopy history
+  happened to already be cached from earlier days — never that day's
+  own session. Both the price-based signals (RSI, MAs, 20-day-high
+  breakout, plain volume spike) and the delivery-volume spike signal
+  are only meaningful once a session's data is actually final.
+- SCHEDULED_HOUR/SCHEDULED_MINUTE now default to 18:30 IST (6:30 PM),
+  safely after NSE's 15:30 IST close AND after NSE typically publishes
+  the day's full bhavcopy (DELIV_QTY) file, which is what feeds the
+  delivery-volume-spike signal. This is a config value, not a hardcoded
+  time — see SCHEDULED_HOUR / SCHEDULED_MINUTE below if your bhavcopy
+  publish times differ or you want more buffer.
+- get_watchlist() (the live Nifty LargeMidcap 250 constituent download)
+  and build_delivery_cache() are unchanged in behavior — they already
+  re-fetch fresh data on every run_once() call — so simply moving WHEN
+  run_once() fires each day automatically updates both the stock
+  universe and the delivery-volume history to reflect that day's
+  after-close data, with no other code changes required.
+- run_scheduler()'s startup log line now prints the actual configured
+  time instead of a hardcoded "8 AM IST" string, so it can't drift out
+  of sync with SCHEDULED_HOUR/SCHEDULED_MINUTE again.
 """
 
 
@@ -275,6 +302,11 @@ def get_watchlist():
     Returns the symbols to scan: the live Nifty LargeMidcap 250
     constituent list if the download succeeds, otherwise the small
     static FALLBACK_WATCHLIST so the script can still run.
+
+    Called fresh on every run_once() (via build_report()), so an
+    after-market scheduled run automatically picks up any index
+    reconstitution that happened that day — no separate "update the
+    stock list" step is needed.
     """
     live = fetch_nifty_largemidcap250()
     if live:
@@ -353,7 +385,27 @@ RS_WINDOW               = 55
 RS_MOMENTUM_WINDOW      = 10
 SECTOR_SCORE_ADJ        = {"Leading":1.5,"Improving":1.0,"Weakening":-0.5,"Lagging":-1.5,"Unknown":0.0}
 EXCLUDE_LAGGING         = False
-SCHEDULED_HOUR, SCHEDULED_MINUTE = 8, 0
+
+# ── Scheduled run time (IST) ──
+# NSE trading hours are 09:15-15:30 IST. This is deliberately set well
+# AFTER the 15:30 close (rather than the old 08:00 pre-market default)
+# so that:
+#   1. The technical signals (RSI, MAs, 20-day-high breakout, plain
+#      volume spike) are computed off that day's own final close, not
+#      the previous session's.
+#   2. The delivery-volume-spike signal has a real shot at that day's
+#      NSE bhavcopy (sec_bhavdata_full_*.csv) already being published —
+#      NSE typically posts it in the hour or two after close, so 18:30
+#      leaves a comfortable buffer. build_delivery_cache() still skips
+#      any day whose file genuinely isn't up yet, so a late bhavcopy
+#      just means one fewer session in the 20-day average, not a crash.
+#   3. get_watchlist()'s live Nifty LargeMidcap 250 download and the
+#      delivery cache are both re-fetched fresh on every run, so this
+#      single time change is enough to make the whole stock list +
+#      delivery data update automatically every day — no other code
+#      changes needed.
+# Adjust if your bhavcopy source publishes later/earlier for you.
+SCHEDULED_HOUR, SCHEDULED_MINUTE = 18, 30
 
 # ─────────────────────── GOOGLE SHEETS ────────────────────────
 
@@ -1244,7 +1296,9 @@ def run_once(dry_run=False):
 
 def run_scheduler():
     print(f"Scheduler active. Will run Mon-Fri at "
-          f"{SCHEDULED_HOUR:02d}:{SCHEDULED_MINUTE:02d} IST.")
+          f"{SCHEDULED_HOUR:02d}:{SCHEDULED_MINUTE:02d} IST "
+          f"(after NSE market close at 15:30 IST), auto-refreshing the "
+          f"stock watchlist and delivery-volume data on every run.")
     last_date = None
     while True:
         now = datetime.now(IST)
@@ -1266,7 +1320,7 @@ def run_scheduler():
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--now",      action="store_true", help="Run once immediately")
-    p.add_argument("--schedule", action="store_true", help="Run on Mon-Fri 8AM IST loop")
+    p.add_argument("--schedule", action="store_true", help="Run on Mon-Fri, after market close (see SCHEDULED_HOUR/MINUTE)")
     p.add_argument("--dry-run",  action="store_true", help="Run once, print results, skip Google Sheets entirely")
     args = p.parse_args()
 
