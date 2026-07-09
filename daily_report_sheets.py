@@ -3,7 +3,7 @@ Daily Stock Recommendation Agent → Google Sheets
 -------------------------------------------------
 Combines:
   1. Technical signals (RSI, MA crossover, volume spike, 200-DMA gate,
-     20-day high breakout)
+     20-day high breakout, 2x delivery-volume spike vs 20-day average)
   2. Fundamental analysis (P/E, ROE, D/E, margins, revenue growth)
   3. DCF intrinsic value model (skipped for banks/financials, averaged over
      multiple years, with guardrails on the discount/terminal-growth spread)
@@ -128,6 +128,38 @@ CHANGE LOG (this revision) — watchlist switched to Nifty LargeMidcap 250
   stale constant.
 - TOP_N (still 10) is unchanged, so the sheet still surfaces the best 10
   candidates — just now selected out of ~250 stocks instead of 20.
+
+CHANGE LOG (this revision) — 2x delivery-volume spike signal
+----------------------------------------------------------------------
+- New signal: a stock qualifies when today's NSE *delivery* volume
+  (DELIV_QTY — shares actually taken delivery of, not squared off
+  intraday) is >= DELIVERY_SPIKE_MULTIPLIER (default 2x) the average
+  delivery volume of the prior DELIVERY_LOOKBACK_TRADING_DAYS (default
+  20) sessions. This is a different, and generally stronger, signal
+  than the existing plain-volume spike (which uses total traded
+  volume from yfinance and already feeds the technical score) — a
+  delivery spike specifically flags real accumulation/distribution
+  rather than intraday churn.
+- yfinance does not expose delivery quantity, so this is sourced from
+  NSE's own daily "full bhavcopy" file (sec_bhavdata_full_DDMMYYYY.csv),
+  which is published once per day for the whole market and carries a
+  DELIV_QTY column per symbol. build_delivery_cache() downloads the
+  last ~20 trading days of these files ONCE per run (not once per
+  symbol) and builds an in-memory per-symbol delivery-quantity history;
+  delivery_volume_signal() just looks a symbol up in that cache. Days
+  that fail to download (holiday, not yet published, transient network
+  issue) are skipped rather than treated as zero volume.
+- New "Delivery Volume", "Avg Delivery Vol 20D" and "Delivery Vol Spike
+  (2x)" columns added to the Google Sheet, right after the 20-day-high
+  breakout columns.
+- REQUIRE_DELIVERY_VOLUME_SPIKE (default True) is wired in as a "hard"
+  gate at the same tier as REQUIRE_ABOVE_200DMA / REQUIRE_20D_HIGH_
+  BREAKOUT — i.e. it is informational (shows up in "Meets All Filters"/
+  "Filter Notes") when STRICT_MODE=False (the default), and only
+  actually drops a stock when STRICT_MODE=True. Every other existing
+  condition (fundamental gate, analyst/sentiment/broker soft gates,
+  sector rotation adjustment, combined_score formula, etc.) is
+  unchanged.
 """
 
 
@@ -135,7 +167,7 @@ import os, sys, time, json, io, argparse, traceback
 import requests
 import pandas as pd
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import gspread
@@ -259,6 +291,12 @@ FETCH_RETRIES           = 3     # retries for transient yfinance/network failure
 FETCH_BACKOFF_SEC       = 1.5   # base backoff, doubles each retry
 HIGH_20D_LOOKBACK       = 20    # window for the 20-day-high breakout signal
 
+# ── Delivery volume spike (NSE DELIV_QTY, not yfinance's traded volume) ──
+DELIVERY_LOOKBACK_TRADING_DAYS = 20    # sessions used for the average
+DELIVERY_SPIKE_MULTIPLIER      = 2.0   # today's delivery qty must be >= this x the average
+DELIVERY_CACHE_MAX_CALENDAR_LOOKBACK = 45  # safety ceiling when walking back over holidays/weekends
+NSE_BHAVCOPY_URL_TEMPLATE = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date}.csv"
+
 # ── Shortlist gate ──
 # STRICT_MODE = False (default): filters never hard-drop a stock. Every
 #   symbol with usable price history gets scored and ranked; the sheet
@@ -273,6 +311,7 @@ STRICT_MODE               = False
 
 REQUIRE_ABOVE_200DMA      = True     # hard gate (only enforced if STRICT_MODE)
 REQUIRE_20D_HIGH_BREAKOUT = True     # hard gate (only enforced if STRICT_MODE) — must cross the prior 20-day high
+REQUIRE_DELIVERY_VOLUME_SPIKE = True # hard gate (only enforced if STRICT_MODE) — today's delivery qty >= 2x 20D avg
 MIN_FUNDAMENTAL_SCORE     = 4        # hard gate, out of 10 (only enforced if STRICT_MODE)
 ACCEPTED_ANALYST_RATINGS  = {"buy", "strong_buy"}  # soft gate
 MIN_SENTIMENT_SCORE       = -0.05    # soft gate
@@ -329,6 +368,7 @@ HEADERS = [
     "Entry ₹","Stop-Loss ₹","Target ₹",
     "Last Close ₹","RSI","Trend","200-DMA ₹","Above 200-DMA",
     "20D High Breakout","20D High Prev ₹",
+    "Delivery Vol Spike (2x)","Delivery Volume","Avg Delivery Vol 20D",
     "Fundamental /10","P/E","ROE %","Profit Margin %","Revenue Growth %","D/E",
     "DCF Intrinsic Value ₹","vs CMP %",
     "News Sentiment","Sentiment Score",
@@ -428,6 +468,9 @@ def row_to_sheet_values(rank, r):
         "Yes ✅" if r.get("above_200dma") else "No ❌",
         "Yes ✅" if r.get("crosses_20d_high") else "No ❌",
         r.get("high_20d_prev", ""),
+        "Yes ✅" if r.get("delivery_volume_spike") else "No ❌",
+        r.get("delivery_volume", ""),
+        r.get("avg_delivery_volume_20d", ""),
         r.get("fundamental_score", ""),
         round(r["pe"], 1) if r.get("pe") else "",
         f"{r['roe']*100:.1f}" if r.get("roe") else "",
@@ -821,6 +864,133 @@ def stock_sector_rotation(symbol, ticker, info):
             "sector_score_adj": SECTOR_SCORE_ADJ.get(q, 0.0)}
 
 
+# ─────────────────── DELIVERY VOLUME ─────────────────────────
+#
+# "Delivery volume" (NSE's DELIV_QTY) is the portion of a day's traded
+# quantity that actually settled into demat accounts rather than being
+# squared off intraday. yfinance doesn't expose this — it only has
+# total traded volume — so it's sourced separately from NSE's own daily
+# "full bhavcopy" file, which covers every symbol for one trading day
+# per file. To avoid downloading ~20 files PER SYMBOL, the whole
+# watchlist's delivery history is fetched ONCE per run into
+# _delivery_cache, and delivery_volume_signal() just looks each symbol
+# up in that cache.
+
+_delivery_cache = None  # symbol (no ".NS") -> pd.Series(date-indexed DELIV_QTY), oldest->newest
+
+
+def fetch_bhavcopy_delivery(date_obj):
+    """
+    Downloads one day's NSE full bhavcopy (sec_bhavdata_full_DDMMYYYY.csv),
+    which carries a DELIV_QTY column per symbol, and returns a
+    pd.Series indexed by SYMBOL (EQ series only) -> DELIV_QTY.
+    Returns None if the file isn't available for that date (weekend,
+    market holiday, not yet published, transient network failure) or
+    doesn't parse as expected — callers simply skip that date rather
+    than treating it as zero delivery volume.
+    """
+    date_str = date_obj.strftime("%d%m%Y")
+    url = NSE_BHAVCOPY_URL_TEMPLATE.format(date=date_str)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DailyStockAgent/1.0)"}
+    resp = fetch_with_retry(
+        lambda: requests.get(url, headers=headers, timeout=15),
+        retries=1, label=f"bhavcopy {date_str}",
+    )
+    if resp is None or resp.status_code != 200 or not resp.text.strip():
+        return None
+    try:
+        df = pd.read_csv(io.StringIO(resp.text))
+        df.columns = [c.strip() for c in df.columns]
+        if "SYMBOL" not in df.columns or "DELIV_QTY" not in df.columns:
+            print(f"[delivery] {date_str}: bhavcopy missing SYMBOL/DELIV_QTY columns "
+                  f"(columns: {list(df.columns)})")
+            return None
+        if "SERIES" in df.columns:
+            df = df[df["SERIES"].astype(str).str.strip() == "EQ"]
+        df["SYMBOL"]    = df["SYMBOL"].astype(str).str.strip()
+        df["DELIV_QTY"] = pd.to_numeric(df["DELIV_QTY"], errors="coerce")
+        df = df.dropna(subset=["DELIV_QTY"]).set_index("SYMBOL")
+        return df["DELIV_QTY"]
+    except Exception as e:
+        print(f"[delivery] Failed to parse bhavcopy for {date_str}: {e}")
+        return None
+
+
+def build_delivery_cache(symbols,
+                          lookback_trading_days=DELIVERY_LOOKBACK_TRADING_DAYS,
+                          max_calendar_lookback=DELIVERY_CACHE_MAX_CALENDAR_LOOKBACK):
+    """
+    Walks backwards day-by-day from today (skipping Sat/Sun), downloading
+    NSE's daily bhavcopy until `lookback_trading_days + 1` sessions have
+    been collected (the "+1" is today's/most-recent session, used as the
+    spike day; the remaining sessions form the 20-day average) or
+    `max_calendar_lookback` calendar days have been checked, whichever
+    comes first. Days that fail to download (holidays, files not yet
+    published, transient errors) are silently skipped and don't count
+    toward either limit's numerator.
+
+    Returns: dict of symbol (no ".NS" suffix) -> pd.Series(date-indexed
+    DELIV_QTY), sorted oldest->newest. Symbols with fewer than 2 sessions
+    of data are omitted — delivery_volume_signal() treats a missing
+    symbol as "not enough data" rather than a false spike/non-spike.
+    """
+    per_symbol = {}
+    day = datetime.now(IST).date()
+    collected_days = 0
+    calendar_checked = 0
+    while collected_days < lookback_trading_days + 1 and calendar_checked < max_calendar_lookback:
+        if day.weekday() < 5:  # Mon-Fri only; NSE holidays are handled by the None-return skip below
+            deliv = fetch_bhavcopy_delivery(day)
+            if deliv is not None:
+                for sym, qty in deliv.items():
+                    per_symbol.setdefault(sym, {})[day] = qty
+                collected_days += 1
+        day -= timedelta(days=1)
+        calendar_checked += 1
+
+    cache = {sym: pd.Series(d).sort_index() for sym, d in per_symbol.items()}
+    print(f"[delivery] Built delivery-volume cache from {collected_days} session(s) of NSE bhavcopy "
+          f"({calendar_checked} calendar day(s) checked); {len(cache)} symbol(s) have usable history.")
+    return cache
+
+
+def delivery_volume_signal(symbol):
+    """
+    Looks `symbol` up in the module-level _delivery_cache (built once per
+    run by build_delivery_cache, called from build_report) and checks
+    whether the most recent session's delivered quantity is
+    >= DELIVERY_SPIKE_MULTIPLIER x the average of the prior
+    DELIVERY_LOOKBACK_TRADING_DAYS sessions.
+
+    Returns delivery_volume_spike=False (with None volumes) if the cache
+    hasn't been built yet or this symbol doesn't have enough cached
+    history (bhavcopy fetch failures, newly listed stock, symbol not
+    covered by NSE cash-market bhavcopy, etc.) — same "missing data
+    degrades gracefully, never crashes" pattern as the other signals.
+    """
+    global _delivery_cache
+    if not _delivery_cache:
+        return {"delivery_volume": None, "avg_delivery_volume_20d": None, "delivery_volume_spike": False}
+
+    bare = symbol.replace(".NS", "")
+    series = _delivery_cache.get(bare)
+    if series is None or len(series) < 2:
+        return {"delivery_volume": None, "avg_delivery_volume_20d": None, "delivery_volume_spike": False}
+
+    latest = series.iloc[-1]
+    prior  = series.iloc[:-1].tail(DELIVERY_LOOKBACK_TRADING_DAYS)
+    if prior.empty:
+        return {"delivery_volume": int(latest), "avg_delivery_volume_20d": None, "delivery_volume_spike": False}
+
+    avg_prior = prior.mean()
+    spike = bool(avg_prior > 0 and latest >= DELIVERY_SPIKE_MULTIPLIER * avg_prior)
+    return {
+        "delivery_volume": int(latest),
+        "avg_delivery_volume_20d": round(float(avg_prior), 0),
+        "delivery_volume_spike": spike,
+    }
+
+
 # ─────────────────────── FILTERS ─────────────────────────────
 #
 # evaluate_filters() always computes which gates a stock fails and
@@ -835,10 +1005,12 @@ def stock_sector_rotation(symbol, ticker, info):
 # quadrant) never drop a stock even in STRICT_MODE if the underlying
 # data is simply missing — only an actual unfavorable value counts.
 #
-# NOTE: the 20-day high breakout signal (REQUIRE_20D_HIGH_BREAKOUT) is
-# wired in below as a "hard" gate, same tier as REQUIRE_ABOVE_200DMA —
+# NOTE: the 20-day high breakout signal (REQUIRE_20D_HIGH_BREAKOUT) and
+# the 2x delivery-volume spike signal (REQUIRE_DELIVERY_VOLUME_SPIKE) are
+# wired in below as "hard" gates, same tier as REQUIRE_ABOVE_200DMA —
 # only enforced (i.e. actually drops the stock) when STRICT_MODE=True.
-# It no longer contributes to combined_score directly.
+# Neither contributes to combined_score directly; both are pass/fail
+# buying conditions surfaced via "Meets All Filters" / "Filter Notes".
 
 def evaluate_filters(r):
     notes = []
@@ -850,6 +1022,11 @@ def evaluate_filters(r):
 
     if REQUIRE_20D_HIGH_BREAKOUT and not r.get("crosses_20d_high"):
         notes.append("did not cross 20-day high (hard gate)")
+        hard_fail = True
+
+    if REQUIRE_DELIVERY_VOLUME_SPIKE and not r.get("delivery_volume_spike"):
+        notes.append(f"delivery volume did not spike {DELIVERY_SPIKE_MULTIPLIER}x vs "
+                      f"{DELIVERY_LOOKBACK_TRADING_DAYS}D avg (hard gate)")
         hard_fail = True
 
     if r.get("fundamental_score", 0) < MIN_FUNDAMENTAL_SCORE:
@@ -877,8 +1054,13 @@ def evaluate_filters(r):
 # ────────────────────── BUILD REPORT ─────────────────────────
 
 def build_report(verbose=False, watchlist=None):
+    global _delivery_cache
     if watchlist is None:
         watchlist = get_watchlist()
+
+    # Built ONCE for the whole watchlist (one bhavcopy file per day covers
+    # every symbol), not once per symbol — see the DELIVERY VOLUME section.
+    _delivery_cache = build_delivery_cache(watchlist)
 
     rows = []
     no_history = []   # symbols we couldn't even get price data for
@@ -905,6 +1087,8 @@ def build_report(verbose=False, watchlist=None):
         for fn in (analyst_consensus, fundamental_score, dcf_intrinsic_value,
                    news_sentiment, broker_recommendation_trend, stock_sector_rotation):
             tech.update(fn(sym, ticker, info))
+
+        tech.update(delivery_volume_signal(sym))
 
         # Combined score
         c = tech["score"]
@@ -960,9 +1144,10 @@ def build_report(verbose=False, watchlist=None):
         for i, r in enumerate(shortlisted, 1):
             flag = "✅" if r["meets_all_filters"] else "⚠️ "
             breakout = "🚀20D-HIGH" if r.get("crosses_20d_high") else ""
+            deliv_spike = "📦2x-DELIVERY" if r.get("delivery_volume_spike") else ""
             print(f"{i:>2}. {flag} {r['symbol']:<14} score={r['combined_score']:<6} "
                   f"close={r.get('last_close')}  sector={r.get('sector_label')}  "
-                  f"quadrant={r.get('sector_quadrant')}  {breakout}")
+                  f"quadrant={r.get('sector_quadrant')}  {breakout} {deliv_spike}")
             if r["filter_notes"]:
                 print(f"       notes: {'; '.join(r['filter_notes'])}")
         if dropped:
