@@ -3,7 +3,8 @@ Daily Stock Recommendation Agent → Google Sheets
 -------------------------------------------------
 Combines:
   1. Technical signals (RSI, MA crossover, volume spike, 200-DMA gate,
-     20-day high breakout, 2x delivery-volume spike vs 20-day average)
+     20-day high breakout, 2x delivery-volume spike vs 20-day average,
+     average daily turnover liquidity floor, turnover spike)
   2. Fundamental analysis (P/E, ROE, D/E, margins, revenue growth)
   3. DCF intrinsic value model (skipped for banks/financials, averaged over
      multiple years, with guardrails on the discount/terminal-growth spread)
@@ -187,6 +188,40 @@ CHANGE LOG (this revision) — scheduled run moved to after market close
 - run_scheduler()'s startup log line now prints the actual configured
   time instead of a hardcoded "8 AM IST" string, so it can't drift out
   of sync with SCHEDULED_HOUR/SCHEDULED_MINUTE again.
+
+CHANGE LOG (this revision) — turnover (₹ value) metrics added
+----------------------------------------------------------------------
+- New signal #1: average daily TURNOVER (₹ value = close * volume,
+  rolled over TURNOVER_LOOKBACK_TRADING_DAYS sessions), computed in
+  analyze_technicals() from the same `hist` DataFrame already fetched
+  (no extra network calls). Exposed as "avg_turnover_cr" (₹ crore) and
+  "turnover_spike" (today's turnover >= 2x the 20D average) on the
+  technical result dict. This is purely a LIQUIDITY filter — can you
+  actually enter/exit a swing position without moving the price? —
+  distinct from the delivery-volume signal, which measures conviction/
+  accumulation rather than tradability.
+- REQUIRE_MIN_TURNOVER (default True) / MIN_AVG_TURNOVER_CR (default
+  ₹5 crore/day) wired into evaluate_filters() as a "hard" gate at the
+  same tier as REQUIRE_ABOVE_200DMA etc. — informational only unless
+  STRICT_MODE=True, consistent with every other hard gate in this
+  script. Missing turnover data (couldn't compute) is itself treated
+  as a hard-gate failure rather than silently passing, since "unknown
+  liquidity" should not be treated as "liquid enough."
+- New signal #2: DELIVERY TURNOVER — the existing delivery-volume
+  signal (DELIV_QTY, share count) converted to ₹ terms by multiplying
+  by last_close, so a 2x delivery-volume spike on a low-priced stock
+  and a high-priced stock become directly comparable. Implemented by
+  passing last_close into delivery_volume_signal(), which now also
+  returns "delivery_turnover_cr" and "avg_delivery_turnover_20d_cr".
+  This does NOT change delivery_volume_spike's pass/fail logic (still
+  share-count based, matching NSE's own convention) — it's an
+  additional, better-normalized ₹ figure surfaced alongside it.
+- New Sheet columns: "Delivery Turnover ₹cr", "Avg Delivery Turnover
+  20D ₹cr", "Avg Turnover ₹cr (20D)", "Turnover Spike (2x)" — added
+  after the existing delivery-volume columns.
+- Neither turnover metric feeds combined_score directly (same
+  "gate/informational, not a scoring input" treatment already used for
+  above_200dma, crosses_20d_high, and delivery_volume_spike).
 """
 
 
@@ -329,6 +364,18 @@ DELIVERY_SPIKE_MULTIPLIER      = 2.0   # today's delivery qty must be >= this x 
 DELIVERY_CACHE_MAX_CALENDAR_LOOKBACK = 45  # safety ceiling when walking back over holidays/weekends
 NSE_BHAVCOPY_URL_TEMPLATE = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date}.csv"
 
+# ── Turnover (₹ value traded) ──
+# "Turnover" here means close * volume — the rupee value traded, not
+# share count. Used as a LIQUIDITY / tradability filter (can you enter
+# and exit a swing position without moving the price?), distinct from
+# the delivery-volume signals above, which measure conviction/
+# accumulation rather than tradability. See analyze_technicals() and
+# delivery_volume_signal() for where these are actually computed.
+TURNOVER_LOOKBACK_TRADING_DAYS = 20     # window for the average, mirrors DELIVERY_LOOKBACK_TRADING_DAYS
+TURNOVER_SPIKE_MULTIPLIER      = 2.0    # today's turnover must be >= this x the 20D average to count as a spike
+MIN_AVG_TURNOVER_CR            = 5.0    # ₹ crore/day liquidity floor
+REQUIRE_MIN_TURNOVER           = True   # hard gate (only enforced if STRICT_MODE)
+
 # ── Shortlist gate ──
 # STRICT_MODE = False (default): filters never hard-drop a stock. Every
 #   symbol with usable price history gets scored and ranked; the sheet
@@ -391,8 +438,8 @@ EXCLUDE_LAGGING         = False
 # AFTER the 15:30 close (rather than the old 08:00 pre-market default)
 # so that:
 #   1. The technical signals (RSI, MAs, 20-day-high breakout, plain
-#      volume spike) are computed off that day's own final close, not
-#      the previous session's.
+#      volume spike, turnover) are computed off that day's own final
+#      close, not the previous session's.
 #   2. The delivery-volume-spike signal has a real shot at that day's
 #      NSE bhavcopy (sec_bhavdata_full_*.csv) already being published —
 #      NSE typically posts it in the hour or two after close, so 18:30
@@ -421,6 +468,8 @@ HEADERS = [
     "Last Close ₹","RSI","Trend","200-DMA ₹","Above 200-DMA",
     "20D High Breakout","20D High Prev ₹",
     "Delivery Vol Spike (2x)","Delivery Volume","Avg Delivery Vol 20D",
+    "Delivery Turnover ₹cr","Avg Delivery Turnover 20D ₹cr",
+    "Avg Turnover ₹cr (20D)","Turnover Spike (2x)",
     "Fundamental /10","P/E","ROE %","Profit Margin %","Revenue Growth %","D/E",
     "DCF Intrinsic Value ₹","vs CMP %",
     "News Sentiment","Sentiment Score",
@@ -523,6 +572,10 @@ def row_to_sheet_values(rank, r):
         "Yes ✅" if r.get("delivery_volume_spike") else "No ❌",
         r.get("delivery_volume", ""),
         r.get("avg_delivery_volume_20d", ""),
+        r.get("delivery_turnover_cr", ""),
+        r.get("avg_delivery_turnover_20d_cr", ""),
+        r.get("avg_turnover_cr", ""),
+        "Yes ✅" if r.get("turnover_spike") else "No ❌",
         r.get("fundamental_score", ""),
         round(r["pe"], 1) if r.get("pe") else "",
         f"{r['roe']*100:.1f}" if r.get("roe") else "",
@@ -689,6 +742,21 @@ def analyze_technicals(symbol, ticker):
         healthy_rsi   = 45 <= rsi.iloc[-1] <= 68
         vol_spike     = vol.iloc[-1] > 1.3 * vol.rolling(20).mean().iloc[-1]
 
+        # ── Average daily turnover (₹) — liquidity floor, see MIN_AVG_TURNOVER_CR ──
+        # Uses close*volume per session (a standard approximation for daily
+        # turnover; NSE's own bhavcopy TTL_TRD_QNTY/TURNOVER_LACS would be
+        # more exact but this avoids a second network fetch per symbol).
+        # This is purely a tradability/liquidity measure — separate from
+        # the delivery-volume signals below, which measure conviction.
+        turnover_series  = close * vol
+        avg_turnover_20d = turnover_series.rolling(TURNOVER_LOOKBACK_TRADING_DAYS).mean().iloc[-1]
+        avg_turnover_cr  = round(avg_turnover_20d / 1e7, 2) if pd.notna(avg_turnover_20d) else None  # ₹ crore
+        today_turnover   = close.iloc[-1] * vol.iloc[-1]
+        turnover_spike   = bool(
+            pd.notna(avg_turnover_20d) and avg_turnover_20d > 0
+            and today_turnover >= TURNOVER_SPIKE_MULTIPLIER * avg_turnover_20d
+        )
+
         # ── 20-day high breakout ──
         # True when today's close crosses above the highest close of the
         # prior HIGH_20D_LOOKBACK trading days (classic breakout trigger).
@@ -715,6 +783,8 @@ def analyze_technicals(symbol, ticker):
             "above_200dma": above200,
             "crosses_20d_high": crosses_20d_high,
             "high_20d_prev": round(high_20d_prev, 2) if pd.notna(high_20d_prev) else None,
+            "avg_turnover_cr": avg_turnover_cr,
+            "turnover_spike": turnover_spike,
         }
     except Exception as e:
         print(f"[technical] {symbol}: {e}")
@@ -1006,7 +1076,7 @@ def build_delivery_cache(symbols,
     return cache
 
 
-def delivery_volume_signal(symbol):
+def delivery_volume_signal(symbol, last_close=None):
     """
     Looks `symbol` up in the module-level _delivery_cache (built once per
     run by build_delivery_cache, called from build_report) and checks
@@ -1019,28 +1089,59 @@ def delivery_volume_signal(symbol):
     history (bhavcopy fetch failures, newly listed stock, symbol not
     covered by NSE cash-market bhavcopy, etc.) — same "missing data
     degrades gracefully, never crashes" pattern as the other signals.
+
+    If `last_close` is provided, also converts delivered quantity into
+    ₹ DELIVERY TURNOVER (delivery_volume * last_close) — this normalizes
+    across stocks of very different share prices, since "2x delivery
+    volume" means something different for a ₹20 stock vs a ₹2,000 one.
+    last_close (today's close) is applied to both today's and the
+    historical average delivery quantity; this is an approximation (a
+    fully precise figure would use each day's own close) that's
+    acceptable for ranking/comparison purposes, not exact ₹ accounting.
+    Does NOT change delivery_volume_spike's pass/fail logic, which stays
+    share-count based to match NSE's own convention.
     """
     global _delivery_cache
+    empty_result = {
+        "delivery_volume": None, "avg_delivery_volume_20d": None,
+        "delivery_volume_spike": False,
+        "delivery_turnover_cr": None, "avg_delivery_turnover_20d_cr": None,
+    }
+
     if not _delivery_cache:
-        return {"delivery_volume": None, "avg_delivery_volume_20d": None, "delivery_volume_spike": False}
+        return empty_result
 
     bare = symbol.replace(".NS", "")
     series = _delivery_cache.get(bare)
     if series is None or len(series) < 2:
-        return {"delivery_volume": None, "avg_delivery_volume_20d": None, "delivery_volume_spike": False}
+        return empty_result
 
     latest = series.iloc[-1]
     prior  = series.iloc[:-1].tail(DELIVERY_LOOKBACK_TRADING_DAYS)
     if prior.empty:
-        return {"delivery_volume": int(latest), "avg_delivery_volume_20d": None, "delivery_volume_spike": False}
+        result = {"delivery_volume": int(latest), "avg_delivery_volume_20d": None,
+                   "delivery_volume_spike": False}
+    else:
+        avg_prior = prior.mean()
+        spike = bool(avg_prior > 0 and latest >= DELIVERY_SPIKE_MULTIPLIER * avg_prior)
+        result = {
+            "delivery_volume": int(latest),
+            "avg_delivery_volume_20d": round(float(avg_prior), 0),
+            "delivery_volume_spike": spike,
+        }
 
-    avg_prior = prior.mean()
-    spike = bool(avg_prior > 0 and latest >= DELIVERY_SPIKE_MULTIPLIER * avg_prior)
-    return {
-        "delivery_volume": int(latest),
-        "avg_delivery_volume_20d": round(float(avg_prior), 0),
-        "delivery_volume_spike": spike,
-    }
+    # ₹-value delivery turnover, in crore, for cross-stock comparability
+    if last_close and result.get("delivery_volume") is not None:
+        result["delivery_turnover_cr"] = round(result["delivery_volume"] * last_close / 1e7, 2)
+    else:
+        result["delivery_turnover_cr"] = None
+
+    if last_close and result.get("avg_delivery_volume_20d") is not None:
+        result["avg_delivery_turnover_20d_cr"] = round(result["avg_delivery_volume_20d"] * last_close / 1e7, 2)
+    else:
+        result["avg_delivery_turnover_20d_cr"] = None
+
+    return result
 
 
 # ─────────────────────── FILTERS ─────────────────────────────
@@ -1057,12 +1158,16 @@ def delivery_volume_signal(symbol):
 # quadrant) never drop a stock even in STRICT_MODE if the underlying
 # data is simply missing — only an actual unfavorable value counts.
 #
-# NOTE: the 20-day high breakout signal (REQUIRE_20D_HIGH_BREAKOUT) and
-# the 2x delivery-volume spike signal (REQUIRE_DELIVERY_VOLUME_SPIKE) are
-# wired in below as "hard" gates, same tier as REQUIRE_ABOVE_200DMA —
-# only enforced (i.e. actually drops the stock) when STRICT_MODE=True.
-# Neither contributes to combined_score directly; both are pass/fail
-# buying conditions surfaced via "Meets All Filters" / "Filter Notes".
+# NOTE: the 20-day high breakout signal (REQUIRE_20D_HIGH_BREAKOUT), the
+# 2x delivery-volume spike signal (REQUIRE_DELIVERY_VOLUME_SPIKE), and
+# the turnover liquidity floor (REQUIRE_MIN_TURNOVER) are all wired in
+# below as "hard" gates, same tier as REQUIRE_ABOVE_200DMA — only
+# enforced (i.e. actually drops the stock) when STRICT_MODE=True. None
+# of them contribute to combined_score directly; all are pass/fail
+# buying/tradability conditions surfaced via "Meets All Filters" /
+# "Filter Notes". Unlike the other hard gates, missing turnover data is
+# itself treated as a failure (rather than being silently skipped),
+# since "we don't know if this is liquid" shouldn't default to "pass."
 
 def evaluate_filters(r):
     notes = []
@@ -1080,6 +1185,15 @@ def evaluate_filters(r):
         notes.append(f"delivery volume did not spike {DELIVERY_SPIKE_MULTIPLIER}x vs "
                       f"{DELIVERY_LOOKBACK_TRADING_DAYS}D avg (hard gate)")
         hard_fail = True
+
+    if REQUIRE_MIN_TURNOVER:
+        turnover = r.get("avg_turnover_cr")
+        if turnover is None:
+            notes.append("avg turnover unavailable (hard gate)")
+            hard_fail = True
+        elif turnover < MIN_AVG_TURNOVER_CR:
+            notes.append(f"avg turnover ₹{turnover}cr < ₹{MIN_AVG_TURNOVER_CR}cr (hard gate)")
+            hard_fail = True
 
     if r.get("fundamental_score", 0) < MIN_FUNDAMENTAL_SCORE:
         notes.append(f"fundamental score {r.get('fundamental_score', 0)} < {MIN_FUNDAMENTAL_SCORE} (hard gate)")
@@ -1140,7 +1254,7 @@ def build_report(verbose=False, watchlist=None):
                    news_sentiment, broker_recommendation_trend, stock_sector_rotation):
             tech.update(fn(sym, ticker, info))
 
-        tech.update(delivery_volume_signal(sym))
+        tech.update(delivery_volume_signal(sym, last_close=tech.get("last_close")))
 
         # Combined score
         c = tech["score"]
@@ -1197,9 +1311,10 @@ def build_report(verbose=False, watchlist=None):
             flag = "✅" if r["meets_all_filters"] else "⚠️ "
             breakout = "🚀20D-HIGH" if r.get("crosses_20d_high") else ""
             deliv_spike = "📦2x-DELIVERY" if r.get("delivery_volume_spike") else ""
+            turn_spike = "💰2x-TURNOVER" if r.get("turnover_spike") else ""
             print(f"{i:>2}. {flag} {r['symbol']:<14} score={r['combined_score']:<6} "
                   f"close={r.get('last_close')}  sector={r.get('sector_label')}  "
-                  f"quadrant={r.get('sector_quadrant')}  {breakout} {deliv_spike}")
+                  f"quadrant={r.get('sector_quadrant')}  {breakout} {deliv_spike} {turn_spike}")
             if r["filter_notes"]:
                 print(f"       notes: {'; '.join(r['filter_notes'])}")
         if dropped:
