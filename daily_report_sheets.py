@@ -222,6 +222,33 @@ CHANGE LOG (this revision) — turnover (₹ value) metrics added
 - Neither turnover metric feeds combined_score directly (same
   "gate/informational, not a scoring input" treatment already used for
   above_200dma, crosses_20d_high, and delivery_volume_spike).
+
+CHANGE LOG (this revision) — volume z-score filter (z > 2)
+----------------------------------------------------------------------
+- New signal: a statistical (standard-deviation based) volume spike
+  check, distinct from the existing fixed-multiplier "volume_spike"
+  (1.3x of the 20D average) already feeding combined_score. Computed
+  in analyze_technicals() from the same `hist` DataFrame (no extra
+  network calls): z = (today's volume - rolling mean) / rolling std,
+  over VOLUME_ZSCORE_LOOKBACK (default 20) sessions. A z-score > 2
+  means today's volume is more than 2 standard deviations above its
+  recent average — a statistically unusual print, not just "somewhat
+  higher than normal." Exposed as "volume_zscore" and
+  "volume_zscore_spike" on the technical result dict.
+- REQUIRE_VOLUME_ZSCORE_SPIKE (default True) / VOLUME_ZSCORE_THRESHOLD
+  (default 2.0) wired into evaluate_filters() as a "hard" gate at the
+  same tier as REQUIRE_ABOVE_200DMA / REQUIRE_20D_HIGH_BREAKOUT /
+  REQUIRE_DELIVERY_VOLUME_SPIKE / REQUIRE_MIN_TURNOVER — informational
+  only (shows up in "Meets All Filters" / "Filter Notes") unless
+  STRICT_MODE=True, consistent with every other hard gate in this
+  script. Missing/undefined z-score (not enough history to compute a
+  rolling std, or std is 0/NaN) is treated as a hard-gate failure
+  rather than silently passing, same pattern as REQUIRE_MIN_TURNOVER.
+- Does NOT feed combined_score directly — same "gate/informational,
+  not a scoring input" treatment already used for above_200dma,
+  crosses_20d_high, delivery_volume_spike, and turnover_spike.
+- New Sheet columns: "Volume Z-Score", "Volume Z-Score Spike (>2)" —
+  added after the existing "Turnover Spike (2x)" column.
 """
 
 
@@ -376,6 +403,17 @@ TURNOVER_SPIKE_MULTIPLIER      = 2.0    # today's turnover must be >= this x the
 MIN_AVG_TURNOVER_CR            = 5.0    # ₹ crore/day liquidity floor
 REQUIRE_MIN_TURNOVER           = True   # hard gate (only enforced if STRICT_MODE)
 
+# ── Volume z-score (statistical spike detection) ──
+# z = (today's volume - rolling mean) / rolling std, over
+# VOLUME_ZSCORE_LOOKBACK sessions. A z-score above VOLUME_ZSCORE_THRESHOLD
+# flags a statistically unusual volume print (>2 standard deviations above
+# recent norm), which is a stricter/different test than the fixed 1.3x
+# "volume_spike" multiplier already feeding combined_score. See
+# analyze_technicals() for where this is computed.
+VOLUME_ZSCORE_LOOKBACK          = 20    # window for the rolling mean/std
+VOLUME_ZSCORE_THRESHOLD         = 2.0   # z-score must be > this to count as a spike
+REQUIRE_VOLUME_ZSCORE_SPIKE     = True  # hard gate (only enforced if STRICT_MODE)
+
 # ── Shortlist gate ──
 # STRICT_MODE = False (default): filters never hard-drop a stock. Every
 #   symbol with usable price history gets scored and ranked; the sheet
@@ -470,6 +508,7 @@ HEADERS = [
     "Delivery Vol Spike (2x)","Delivery Volume","Avg Delivery Vol 20D",
     "Delivery Turnover ₹cr","Avg Delivery Turnover 20D ₹cr",
     "Avg Turnover ₹cr (20D)","Turnover Spike (2x)",
+    "Volume Z-Score","Volume Z-Score Spike (>2)",
     "Fundamental /10","P/E","ROE %","Profit Margin %","Revenue Growth %","D/E",
     "DCF Intrinsic Value ₹","vs CMP %",
     "News Sentiment","Sentiment Score",
@@ -576,6 +615,8 @@ def row_to_sheet_values(rank, r):
         r.get("avg_delivery_turnover_20d_cr", ""),
         r.get("avg_turnover_cr", ""),
         "Yes ✅" if r.get("turnover_spike") else "No ❌",
+        r.get("volume_zscore", ""),
+        "Yes ✅" if r.get("volume_zscore_spike") else "No ❌",
         r.get("fundamental_score", ""),
         round(r["pe"], 1) if r.get("pe") else "",
         f"{r['roe']*100:.1f}" if r.get("roe") else "",
@@ -757,6 +798,23 @@ def analyze_technicals(symbol, ticker):
             and today_turnover >= TURNOVER_SPIKE_MULTIPLIER * avg_turnover_20d
         )
 
+        # ── Volume z-score (statistical spike detection) ──
+        # z = (today's volume - rolling mean) / rolling std over
+        # VOLUME_ZSCORE_LOOKBACK sessions. Distinct from vol_spike above
+        # (a fixed 1.3x multiplier that feeds combined_score) — this is a
+        # standard-deviation based test, flagged when z > VOLUME_ZSCORE_
+        # THRESHOLD (default 2.0), i.e. today's volume is a statistically
+        # unusual print relative to its own recent distribution rather
+        # than just "somewhat above average."
+        vol_roll_mean = vol.rolling(VOLUME_ZSCORE_LOOKBACK).mean().iloc[-1]
+        vol_roll_std  = vol.rolling(VOLUME_ZSCORE_LOOKBACK).std().iloc[-1]
+        volume_zscore = None
+        volume_zscore_spike = False
+        if pd.notna(vol_roll_mean) and pd.notna(vol_roll_std) and vol_roll_std > 0:
+            volume_zscore = (vol.iloc[-1] - vol_roll_mean) / vol_roll_std
+            volume_zscore_spike = bool(volume_zscore > VOLUME_ZSCORE_THRESHOLD)
+            volume_zscore = round(float(volume_zscore), 2)
+
         # ── 20-day high breakout ──
         # True when today's close crosses above the highest close of the
         # prior HIGH_20D_LOOKBACK trading days (classic breakout trigger).
@@ -785,6 +843,8 @@ def analyze_technicals(symbol, ticker):
             "high_20d_prev": round(high_20d_prev, 2) if pd.notna(high_20d_prev) else None,
             "avg_turnover_cr": avg_turnover_cr,
             "turnover_spike": turnover_spike,
+            "volume_zscore": volume_zscore,
+            "volume_zscore_spike": volume_zscore_spike,
         }
     except Exception as e:
         print(f"[technical] {symbol}: {e}")
@@ -1159,15 +1219,16 @@ def delivery_volume_signal(symbol, last_close=None):
 # data is simply missing — only an actual unfavorable value counts.
 #
 # NOTE: the 20-day high breakout signal (REQUIRE_20D_HIGH_BREAKOUT), the
-# 2x delivery-volume spike signal (REQUIRE_DELIVERY_VOLUME_SPIKE), and
-# the turnover liquidity floor (REQUIRE_MIN_TURNOVER) are all wired in
-# below as "hard" gates, same tier as REQUIRE_ABOVE_200DMA — only
-# enforced (i.e. actually drops the stock) when STRICT_MODE=True. None
-# of them contribute to combined_score directly; all are pass/fail
+# 2x delivery-volume spike signal (REQUIRE_DELIVERY_VOLUME_SPIKE), the
+# turnover liquidity floor (REQUIRE_MIN_TURNOVER), and the volume
+# z-score spike (REQUIRE_VOLUME_ZSCORE_SPIKE) are all wired in below as
+# "hard" gates, same tier as REQUIRE_ABOVE_200DMA — only enforced (i.e.
+# actually drops the stock) when STRICT_MODE=True. None of them
+# contribute to combined_score directly; all are pass/fail
 # buying/tradability conditions surfaced via "Meets All Filters" /
-# "Filter Notes". Unlike the other hard gates, missing turnover data is
+# "Filter Notes". Like turnover, missing/undefined z-score data is
 # itself treated as a failure (rather than being silently skipped),
-# since "we don't know if this is liquid" shouldn't default to "pass."
+# since "not enough history to judge" shouldn't default to "pass."
 
 def evaluate_filters(r):
     notes = []
@@ -1193,6 +1254,15 @@ def evaluate_filters(r):
             hard_fail = True
         elif turnover < MIN_AVG_TURNOVER_CR:
             notes.append(f"avg turnover ₹{turnover}cr < ₹{MIN_AVG_TURNOVER_CR}cr (hard gate)")
+            hard_fail = True
+
+    if REQUIRE_VOLUME_ZSCORE_SPIKE:
+        zscore = r.get("volume_zscore")
+        if zscore is None:
+            notes.append("volume z-score unavailable (hard gate)")
+            hard_fail = True
+        elif zscore <= VOLUME_ZSCORE_THRESHOLD:
+            notes.append(f"volume z-score {zscore} <= {VOLUME_ZSCORE_THRESHOLD} (hard gate)")
             hard_fail = True
 
     if r.get("fundamental_score", 0) < MIN_FUNDAMENTAL_SCORE:
@@ -1312,9 +1382,10 @@ def build_report(verbose=False, watchlist=None):
             breakout = "🚀20D-HIGH" if r.get("crosses_20d_high") else ""
             deliv_spike = "📦2x-DELIVERY" if r.get("delivery_volume_spike") else ""
             turn_spike = "💰2x-TURNOVER" if r.get("turnover_spike") else ""
+            z_spike = "📈Z>2" if r.get("volume_zscore_spike") else ""
             print(f"{i:>2}. {flag} {r['symbol']:<14} score={r['combined_score']:<6} "
                   f"close={r.get('last_close')}  sector={r.get('sector_label')}  "
-                  f"quadrant={r.get('sector_quadrant')}  {breakout} {deliv_spike} {turn_spike}")
+                  f"quadrant={r.get('sector_quadrant')}  {breakout} {deliv_spike} {turn_spike} {z_spike}")
             if r["filter_notes"]:
                 print(f"       notes: {'; '.join(r['filter_notes'])}")
         if dropped:
